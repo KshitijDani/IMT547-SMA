@@ -56,3 +56,23 @@ python /Users/kshitijdani/Desktop/Ksh_Personal_Projects/UW/IMT547-SMA/feed_react
   --output /Users/kshitijdani/Desktop/Ksh_Personal_Projects/UW/IMT547-SMA/data/Feeds-Interacted-Users.csv \
   --include-reposts
 ```
+
+## Program 3: Creator Account Details
+
+This script reads a CSV containing `creator_did` and `feed_display_name`, fetches account details and the last 15 post texts for each unique creator, and writes the results to a CSV.
+
+Input CSV must include columns:
+- `creator_did`
+- `feed_display_name`
+
+Run example:
+
+```bash
+python /Users/kshitijdani/Desktop/Ksh_Personal_Projects/UW/IMT547-SMA/get_user_data.py \
+  --input /Users/kshitijdani/Desktop/Ksh_Personal_Projects/UW/IMT547-SMA/data/LeftLeaningFeeds.csv \
+  --output /Users/kshitijdani/Desktop/Ksh_Personal_Projects/UW/IMT547-SMA/data/feed_creator_info.csv
+```
+
+Optional flags:
+- `--limit 15` (number of recent posts)
+- `--log-level INFO`
