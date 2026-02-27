@@ -1,0 +1,135 @@
+!pip install atproto --quiet
+
+import json
+
+from atproto import Client, models
+
+USERNAME = ""
+APP_PASSWORD = ""
+
+client = Client()
+client.login(USERNAME, APP_PASSWORD)
+
+from atproto import Client
+
+from atproto import Client
+import json
+
+
+# -----------------------------
+# FEED INFO
+#feed_owner is the feed owner handle
+#feed_rkey is the last "/" of the url usually
+# -----------------------------
+feed_owner = "aendra.com"
+feed_rkey = "news-2-0"
+
+# Resolve handle → DID
+profile = client.app.bsky.actor.get_profile(
+    params={"actor": feed_owner}
+)
+
+did = profile.did
+
+# Build feed generator URI
+feed_uri = f"at://{did}/app.bsky.feed.generator/{feed_rkey}"
+
+# Validate feed URI (recommended)
+gen = client.app.bsky.feed.get_feed_generator(
+    params={"feed": feed_uri}
+)
+
+feed_uri = gen.view.uri
+
+
+# -----------------------------
+# GET FEED POSTS
+# -----------------------------
+feed_resp = client.app.bsky.feed.get_feed(
+    params={
+        "feed": feed_uri,
+        "limit": 10
+    }
+)
+
+feed_results = []
+
+
+# -----------------------------
+# LOOP THROUGH FEED POSTS
+# -----------------------------
+for item in (feed_resp.feed or []):
+
+    post = item.post
+
+    post_data = {
+        "post_uri": post.uri,
+        "poster": post.author.handle,
+        "created_at": post.record.created_at,
+        "text": post.record.text,
+        "like_count": post.like_count,
+        "reply_count": post.reply_count,
+        "repost_count": post.repost_count,
+        "replies": []
+    }
+
+
+    # -----------------------------
+    # GET REPLIES FOR THIS POST
+    # -----------------------------
+    replies = client.app.bsky.feed.get_post_thread(
+        params={
+            "uri": post.uri,
+            "depth": 50,
+            "parent_height": 50
+        }
+    )
+
+    thread = replies.thread
+
+    queue = list(thread.replies or [])
+
+    while queue:
+
+        node = queue.pop()
+
+        reply_post = node.post
+
+        parent_uri = (
+            node.parent.post.uri
+            if getattr(node, "parent", None)
+            and getattr(node.parent, "post", None)
+            else thread.post.uri
+        )
+
+        reply_data = {
+            "parent_uri": parent_uri,
+            "uri": reply_post.uri,
+            "poster": reply_post.author.handle,
+            "created_at": reply_post.record.created_at,
+            "text": reply_post.record.text,
+            "like_count": reply_post.like_count,
+            "reply_count": reply_post.reply_count,
+            "repost_count": reply_post.repost_count,
+        }
+
+        post_data["replies"].append(reply_data)
+
+        queue.extend(node.replies or [])
+
+
+    feed_results.append(post_data)
+
+
+# -----------------------------
+# SAVE TO JSON FILE
+# -----------------------------
+filename = "aendra_news_2_0_feed.json"
+
+with open(filename, "w", encoding="utf-8") as f:
+    json.dump(feed_results, f, indent=4, ensure_ascii=False)
+
+
+print("Saved to:", filename)
+print("Posts saved:", len(feed_results))
+
