@@ -1,0 +1,279 @@
+# pip install pandas openpyxl atproto
+
+import os
+import time
+import random
+from datetime import datetime, timezone, timedelta
+!pip install atproto --quiet
+from atproto import Client, models
+import re
+
+import pandas as pd
+from atproto import Client
+
+INPUT_CSV = "./LeftLeaningFeeds-2.csv"
+OUTPUT_CSV = "feed_likers_one_row_per_user.csv"
+
+# --------------------
+# AUTH
+# --------------------
+USERNAME = ""
+APP_PASSWORD = ""
+
+client = Client()
+client.login(USERNAME, APP_PASSWORD)
+
+# --------------------
+# Helpers
+# --------------------
+def backoff_sleep(attempt: int):
+    time.sleep(min(30, (2 ** attempt) + random.random()))
+
+def safe_call(fn, *args, **kwargs):
+    last_err = None
+    for attempt in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            backoff_sleep(attempt)
+    raise last_err
+
+def parse_bsky_dt(dt_str: str):
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def get_profile(actor: str):
+    return safe_call(client.app.bsky.actor.get_profile, params={"actor": actor})
+
+def get_all_likes_for_uri(uri: str, limit: int = 100):
+    likes = []
+    cursor = None
+    while True:
+        params = {"uri": uri, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        resp = safe_call(client.app.bsky.feed.get_likes, params=params)
+        likes.extend(resp.likes or [])
+        cursor = getattr(resp, "cursor", None)
+        if not cursor:
+            break
+        time.sleep(0.15)
+    return likes
+
+def get_posts_last_2_weeks(actor: str, lookback_days: int = 14):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    posts = []
+    cursor = None
+
+    while True:
+        resp = safe_call(
+            client.app.bsky.feed.get_author_feed,
+            params={"actor": actor, "limit": 100, "cursor": cursor}
+        )
+        items = resp.feed or []
+        if not items:
+            break
+
+        reached_old = False
+        for item in items:
+            p = item.post
+            rec = p.record
+            created_at = parse_bsky_dt(getattr(rec, "created_at", None))
+
+            if created_at and created_at < cutoff:
+                reached_old = True
+                continue
+
+            txt = getattr(rec, "text", None)
+            if txt:
+                posts.append(txt)
+
+        cursor = getattr(resp, "cursor", None)
+        if reached_old or not cursor:
+            break
+
+        time.sleep(0.15)
+
+    return posts
+
+# --------------------
+# Feed URL normalization
+# --------------------
+DID_RE = re.compile(r"^did:[a-z0-9]+:[A-Za-z0-9._-]+$")
+
+def normalize_feed_url_to_at_uri(feed_url: str):
+    """
+    Returns (at_uri, creator_actor, rkey) or (None, None, None) if can't parse.
+
+    Supports:
+      1) at://did:.../app.bsky.feed.generator/<rkey>
+      2) https://bsky.app/profile/<actor>/feed/<rkey>  -> converts using actor->did
+    """
+    if feed_url is None:
+        return None, None, None
+
+    s = str(feed_url).strip().strip('"').strip("'")
+    if not s:
+        return None, None, None
+
+    # Case 1: already AT-URI
+    if s.startswith("at://"):
+        # expected: at://<did>/app.bsky.feed.generator/<rkey>
+        parts = s[5:].split("/")
+        if len(parts) >= 3 and parts[1] == "app.bsky.feed.generator":
+            creator = parts[0]  # usually a DID
+            rkey = parts[2]
+            # creator may be did; if not, still pass through (but get_profile may fail)
+            return s, creator, rkey
+        return None, None, None
+
+    # Case 2: bsky.app web URL
+    # Example: https://bsky.app/profile/<actor>/feed/<rkey>
+    m = re.match(r"^https?://bsky\.app/profile/([^/]+)/feed/([^/?#]+)", s)
+    if m:
+        actor = m.group(1)
+        rkey = m.group(2)
+        # convert actor -> DID
+        prof = get_profile(actor)  # actor can be handle or did
+        creator_did = getattr(prof, "did", None)
+        if not creator_did:
+            return None, None, None
+        at_uri = f"at://{creator_did}/app.bsky.feed.generator/{rkey}"
+        return at_uri, creator_did, rkey
+
+    return None, None, None
+
+# --------------------
+# Load CSV feeds
+# --------------------
+df = pd.read_csv(INPUT_CSV)
+
+if "feed_url" not in df.columns:
+    raise KeyError(f"Expected column 'feed_url'. Found: {list(df.columns)}")
+
+raw_feed_urls = (
+    df["feed_url"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .loc[lambda x: x.ne("")]
+    .unique()
+    .tolist()
+)
+
+print(f"Loaded {len(raw_feed_urls)} feed_url values from CSV")
+
+# --------------------
+# Caches
+# --------------------
+feed_creator_cache = {}   # at_uri -> {creator_did, creator_handle, creator_display_name}
+user_profile_cache = {}   # user_did -> user profile fields
+
+rows = []
+bad_feeds = []
+
+# --------------------
+# Main
+# --------------------
+for i, raw_feed in enumerate(raw_feed_urls, start=1):
+    at_uri, creator_actor, rkey = normalize_feed_url_to_at_uri(raw_feed)
+    if not at_uri:
+        bad_feeds.append(raw_feed)
+        print(f"[SKIP] Unrecognized feed_url format: {raw_feed}")
+        continue
+
+    print(f"[{i}/{len(raw_feed_urls)}] Feed: {raw_feed} -> {at_uri}")
+
+    # creator profile (cache by at_uri)
+    if at_uri not in feed_creator_cache:
+        # creator_actor should be a DID after normalization; but be defensive
+        try:
+            creator_prof = get_profile(creator_actor)
+        except Exception as e:
+            bad_feeds.append(raw_feed)
+            print(f"[SKIP] Cannot fetch creator profile for {raw_feed} (actor={creator_actor}): {e}")
+            continue
+
+        feed_creator_cache[at_uri] = {
+            "creator_did": getattr(creator_prof, "did", None) or creator_actor,
+            "creator_handle": getattr(creator_prof, "handle", None),
+            "creator_display_name": getattr(creator_prof, "display_name", None),
+        }
+
+    creator_info = feed_creator_cache[at_uri]
+
+    # likers for THIS feed only (from your CSV list)
+    try:
+        likes = get_all_likes_for_uri(at_uri)
+    except Exception as e:
+        bad_feeds.append(raw_feed)
+        print(f"[SKIP] get_likes failed for {raw_feed} ({at_uri}): {e}")
+        continue
+
+    seen_likers = set()
+
+    for lk in likes:
+        user_did = lk.actor.did
+        if user_did in seen_likers:
+            continue
+        seen_likers.add(user_did)
+
+        # user profile cache
+        if user_did not in user_profile_cache:
+            try:
+                prof = get_profile(user_did)
+            except Exception as e:
+                print(f"[SKIP USER] get_profile failed for user {user_did}: {e}")
+                continue
+
+            user_profile_cache[user_did] = {
+                "users_did": user_did,
+                "users_handle": getattr(prof, "handle", None),
+                "users_display_name": getattr(prof, "display_name", None),
+                "users_bio": getattr(prof, "description", None),
+                "users_followers_count": getattr(prof, "followers_count", None),
+                "users_follows_count": getattr(prof, "follows_count", None),
+                "users_posts_count": getattr(prof, "posts_count", None),
+            }
+            time.sleep(0.1)
+
+        user_info = user_profile_cache[user_did]
+
+        posts = get_posts_last_2_weeks(user_did)
+
+        rows.append({
+            # keep BOTH for traceability:
+            "feed_url": raw_feed,      # exactly what was in your CSV
+            "feed_at_uri": at_uri,     # normalized AT-URI used for API calls
+
+            **creator_info,
+
+            "liked_at": getattr(lk, "created_at", None),
+            "like_indexed_at": getattr(lk, "indexed_at", None),
+
+            **user_info,
+
+            "posts_last_2_weeks": " || ".join(posts) if posts else None,
+            "posts_last_2_weeks_count": len(posts),
+        })
+
+        time.sleep(0.1)
+
+# --------------------
+# Save
+# --------------------
+out_df = pd.DataFrame(rows)
+out_df.to_csv(OUTPUT_CSV, index=False)
+
+print(f"\nSaved: {OUTPUT_CSV}")
+print(f"Rows: {len(out_df)} (one row per user per feed)")
+print(f"Unique users: {len(user_profile_cache)}")
+print(f"Bad/unparsed feeds skipped: {len(bad_feeds)}")
