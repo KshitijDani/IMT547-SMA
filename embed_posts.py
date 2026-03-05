@@ -7,8 +7,8 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 
-INPUT_CSV = "raw_posts_2weeks.csv"
-OUTPUT_NPY = "embeddings_2weeks.npy"
+INPUT_CSV = "raw_posts_last1000_per_feed.csv"
+OUTPUT_NPY = "embeddings_last1000_per_feed.npy"
 
 
 def load_data():
@@ -19,7 +19,7 @@ def load_data():
     df = pd.read_csv(INPUT_CSV)
 
     if "text" not in df.columns:
-        raise ValueError("Required column 'text' not found in raw_posts_2weeks.csv")
+        raise ValueError(f"Required column 'text' not found in {INPUT_CSV}")
 
     df["text"] = df["text"].fillna("")
     texts = df["text"].astype(str).tolist()

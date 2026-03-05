@@ -10,10 +10,9 @@ BASE_URL = "https://bsky.social/xrpc/"
 SESSION_ENDPOINT = "com.atproto.server.createSession"
 FEED_ENDPOINT = "app.bsky.feed.getFeed"
 INPUT_CSV = "Clean Left Feeds Final - Sheet1.csv"
-OUTPUT_CSV = "raw_posts_Feb2026_first_week.csv"
-START_DATE_UTC = datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
-END_DATE_UTC = datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc)
+OUTPUT_CSV = "raw_posts_last1000_per_feed.csv"
 MAX_PAGES_PER_FEED = 10000
+MAX_POSTS_PER_FEED = 1000
 
 
 def authenticate():
@@ -67,8 +66,8 @@ def parse_created_at(value):
         return None
 
 
-def fetch_feed_posts(feed_at_uri, feed_display_name, access_jwt, start_date_utc, end_date_utc):
-    """Fetch posts for a single feed, keeping only items in [start_date_utc, end_date_utc)."""
+def fetch_feed_posts(feed_at_uri, feed_display_name, access_jwt):
+    """Fetch up to MAX_POSTS_PER_FEED recent posts for a single feed."""
     headers = {"Authorization": f"Bearer {access_jwt}"}
     url = f"{BASE_URL}{FEED_ENDPOINT}"
 
@@ -77,9 +76,9 @@ def fetch_feed_posts(feed_at_uri, feed_display_name, access_jwt, start_date_utc,
     seen_cursors = set()
     cursor = None
     page_count = 0
-    reached_older_posts = False
+    posts_collected = 0
 
-    while True:
+    while posts_collected < MAX_POSTS_PER_FEED:
         if page_count >= MAX_PAGES_PER_FEED:
             print(f"  Reached MAX_PAGES_PER_FEED ({MAX_PAGES_PER_FEED}) for {feed_display_name}")
             break
@@ -118,46 +117,46 @@ def fetch_feed_posts(feed_at_uri, feed_display_name, access_jwt, start_date_utc,
             break
 
         items = data.get("feed", [])
+        if not items:
+            break
+
         page_count += 1
         for item in items:
             post = item.get("post", {})
             author = post.get("author", {})
-            created_at_str = post.get("record", {}).get("createdAt")
-            created_at_dt = parse_created_at(created_at_str)
-
-            if created_at_dt and created_at_dt < start_date_utc:
-                reached_older_posts = True
-                break
-
-            if created_at_dt and created_at_dt >= end_date_utc:
+            post_uri = post.get("uri")
+            if not post_uri or post_uri in seen_post_uris:
                 continue
 
-            if created_at_dt and start_date_utc <= created_at_dt < end_date_utc:
-                post_uri = post.get("uri")
-                if not post_uri or post_uri in seen_post_uris:
-                    continue
-                seen_post_uris.add(post_uri)
-                all_rows.append(
-                    {
-                        "post_uri": post_uri,
-                        "post_cid": post.get("cid"),
-                        "text": post.get("record", {}).get("text"),
-                        "created_at": created_at_dt.isoformat(),
-                        "author_did": author.get("did"),
-                        "author_handle": author.get("handle"),
-                        "reply_count": post.get("replyCount"),
-                        "repost_count": post.get("repostCount"),
-                        "like_count": post.get("likeCount"),
-                        "feed_at_uri": feed_at_uri,
-                        "feed_display_name": feed_display_name,
-                    }
-                )
+            created_at_str = post.get("record", {}).get("createdAt")
+            created_at_dt = parse_created_at(created_at_str)
+            created_at_value = created_at_dt.isoformat() if created_at_dt else created_at_str
+
+            seen_post_uris.add(post_uri)
+            all_rows.append(
+                {
+                    "post_uri": post_uri,
+                    "post_cid": post.get("cid"),
+                    "text": post.get("record", {}).get("text"),
+                    "created_at": created_at_value,
+                    "author_did": author.get("did"),
+                    "author_handle": author.get("handle"),
+                    "reply_count": post.get("replyCount"),
+                    "repost_count": post.get("repostCount"),
+                    "like_count": post.get("likeCount"),
+                    "feed_at_uri": feed_at_uri,
+                    "feed_display_name": feed_display_name,
+                }
+            )
+            posts_collected += 1
+
+            if posts_collected >= MAX_POSTS_PER_FEED:
+                break
 
         print(f"Feed: {feed_display_name}")
-        print(f"Pages crawled: {page_count}")
-        print(f"Posts collected so far: {len(all_rows)}")
+        print(f"Posts collected: {posts_collected}")
 
-        if reached_older_posts:
+        if posts_collected >= MAX_POSTS_PER_FEED:
             break
 
         cursor = data.get("cursor")
@@ -180,13 +179,7 @@ def main():
         feed_display_name = feed.get("feed_display_name")
 
         print(f"Processing feed: {feed_display_name}")
-        rows = fetch_feed_posts(
-            feed_at_uri,
-            feed_display_name,
-            access_jwt,
-            START_DATE_UTC,
-            END_DATE_UTC,
-        )
+        rows = fetch_feed_posts(feed_at_uri, feed_display_name, access_jwt)
         print(f"Collected {len(rows)} posts")
         posts_per_feed[feed_display_name or feed_at_uri] = len(rows)
         all_posts.extend(rows)

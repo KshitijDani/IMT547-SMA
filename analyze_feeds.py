@@ -4,11 +4,11 @@ from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-INPUT_CSV = "raw_posts_2weeks.csv"
-INPUT_EMBEDDINGS = "embeddings_2weeks.npy"
-OUTPUT_DISPERSION = "feed_dispersion.csv"
-OUTPUT_SIMILARITY = "feed_similarity_matrix.csv"
-OUTPUT_PCA = "feed_pca_coordinates.csv"
+INPUT_CSV = "raw_posts_last1000_per_feed.csv"
+INPUT_EMBEDDINGS = "embeddings_last1000_per_feed.npy"
+OUTPUT_DISPERSION = "feed_dispersion_last1000_per_feed.csv"
+OUTPUT_SIMILARITY = "feed_similarity_matrix_last1000_per_feed.csv"
+OUTPUT_PCA = "feed_pca_coordinates_last1000_per_feed.csv"
 
 
 def load_data():
