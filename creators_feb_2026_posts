@@ -1,0 +1,259 @@
+!pip install atproto --quiet
+import os
+import time
+import random
+import re
+import requests
+import pandas as pd
+from datetime import datetime, timezone
+from atproto import Client
+
+
+import pandas as pd
+from atproto import Client
+
+INPUT_CSV = "./Clean Left Feeds Final.csv"
+OUTPUT_CSV = "phase3_creator_posts.csv"
+
+# --------------------
+# AUTH
+# --------------------
+USERNAME = ""
+APP_PASSWORD = ""
+
+client = Client()
+client.login(USERNAME, APP_PASSWORD)
+
+# --------------------
+# Helpers
+# --------------------
+def backoff_sleep(attempt: int):
+    time.sleep(min(30, (2 ** attempt) + random.random()))
+
+def safe_call(fn, *args, **kwargs):
+    last_err = None
+    for attempt in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            backoff_sleep(attempt)
+    raise last_err
+
+def parse_bsky_dt(dt_str: str):
+    if not dt_str:
+        return None
+    s = str(dt_str).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+def get_profile(actor: str):
+    return safe_call(client.app.bsky.actor.get_profile, params={"actor": actor})
+
+def try_get_profile(actor: str):
+    try:
+        return get_profile(actor)
+    except Exception:
+        return None
+
+# --------------------
+# Feed URL normalization (feed_url -> creator DID)
+# --------------------
+PROFILE_URL_RE = re.compile(r"^https?://bsky\.app/profile/([^/]+)/feed/([^/?#]+)")
+DID_FEED_RE = re.compile(r"^at://([^/]+)/app\.bsky\.feed\.generator/([^/?#]+)$")
+
+_actor_to_did_cache = {}
+
+def resolve_creator_did_from_feed_url(feed_url: str):
+    """
+    Returns creator_did or None.
+    Supports:
+      - at://<did>/app.bsky.feed.generator/<rkey>
+      - https://bsky.app/profile/<actor>/feed/<rkey>
+    """
+    if feed_url is None:
+        return None
+
+    s = str(feed_url).strip().strip('"').strip("'")
+    if not s:
+        return None
+
+    m = DID_FEED_RE.match(s)
+    if m:
+        return m.group(1)
+
+    m = PROFILE_URL_RE.match(s)
+    if m:
+        actor = m.group(1)
+
+        if actor in _actor_to_did_cache:
+            return _actor_to_did_cache[actor]
+
+        prof = try_get_profile(actor)
+        if not prof or not getattr(prof, "did", None):
+            print(f"[SKIP] Profile not found for actor: {actor} (from {s})")
+            _actor_to_did_cache[actor] = None
+            return None
+
+        _actor_to_did_cache[actor] = prof.did
+        return prof.did
+
+    return None
+
+# --------------------
+# Pull Feb 2026 posts via HTTP (avoids strict SDK parsing problems)
+# --------------------
+BASE_URL = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+session = requests.Session()
+
+def get_posts_feb_2026_utc(creator_did: str, max_pages: int = 500):
+    start = datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
+    end   = datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    posts = []
+    cursor = None
+    pages = 0
+
+    while True:
+        pages += 1
+        if pages > max_pages:
+            break
+
+        params = {"actor": creator_did, "limit": 100, "filter": "posts_with_replies"}
+        if cursor:
+            params["cursor"] = cursor
+
+        # light retry
+        resp_json = None
+        for attempt in range(6):
+            try:
+                r = session.get(BASE_URL, params=params, timeout=30)
+                if r.status_code == 200:
+                    resp_json = r.json()
+                    break
+                if r.status_code in (400, 401, 403, 404):
+                    return posts
+            except Exception:
+                backoff_sleep(attempt)
+
+        if not resp_json:
+            break
+
+        items = resp_json.get("feed", []) or []
+        if not items:
+            break
+
+        reached_old = False
+
+        for item in items:
+            post = item.get("post") or {}
+            author = post.get("author") or {}
+
+            # keep only creator's own posts (skip repost items)
+            if author.get("did") != creator_did:
+                continue
+
+            record = post.get("record") or {}
+            if not isinstance(record, dict):
+                continue
+
+            created = parse_bsky_dt(record.get("createdAt"))
+            if not created:
+                continue
+
+            if start <= created < end:
+                posts.append({
+                    "post_uri": post.get("uri"),
+                    "post_cid": post.get("cid"),
+                    "created_at_utc": created.isoformat().replace("+00:00", "Z"),
+                    "text": record.get("text"),
+                    "reply_count": post.get("replyCount"),
+                    "repost_count": post.get("repostCount"),
+                    "like_count": post.get("likeCount"),
+                    "quote_count": post.get("quoteCount"),
+                })
+            elif created < start:
+                reached_old = True
+
+        cursor = resp_json.get("cursor")
+        if not cursor or reached_old:
+            break
+
+        time.sleep(0.05)
+
+    posts.sort(key=lambda x: x["created_at_utc"])
+    return posts
+
+# --------------------
+# LOAD CSV (keep ALL columns)
+# --------------------
+src_df = pd.read_csv(INPUT_CSV)
+
+if "feed_url" not in src_df.columns:
+    raise KeyError(f"Expected column 'feed_url'. Found: {list(src_df.columns)}")
+
+print("Source rows loaded:", len(src_df))
+
+# --------------------
+# MAIN: one output row per (source CSV row) x (creator Feb post)
+# with caching so each creator is fetched once
+# --------------------
+profile_cache = {}
+posts_cache = {}
+
+out_rows = []
+skipped_rows = 0
+
+for idx, src_row in src_df.iterrows():
+    src = src_row.to_dict()  # <-- ALL CSV columns preserved
+    feed_url = src.get("feed_url")
+
+    creator_did = resolve_creator_did_from_feed_url(feed_url)
+    if not creator_did:
+        skipped_rows += 1
+        continue
+
+    # creator profile cache
+    if creator_did not in profile_cache:
+        prof = try_get_profile(creator_did)
+        profile_cache[creator_did] = prof  # can be None
+
+    prof = profile_cache[creator_did]
+    creator_handle = getattr(prof, "handle", None) if prof else None
+    creator_display_name = getattr(prof, "display_name", None) if prof else None
+
+    # posts cache
+    if creator_did not in posts_cache:
+        posts_cache[creator_did] = get_posts_feb_2026_utc(creator_did)
+
+    posts = posts_cache[creator_did]
+
+    # If a creator has 0 Feb posts, you can choose to either:
+    # (A) output 0 rows (current behavior), OR
+    # (B) output 1 row with empty post fields.
+    # We'll do (A) by default.
+    for p in posts:
+        out_rows.append({
+            **src,  # <-- ALL CSV columns
+            "creator_did": creator_did,
+            "creator_handle": creator_handle,
+            "creator_display_name": creator_display_name,
+            **p,    # post columns
+        })
+
+print("Creators fetched:", len(posts_cache))
+print("Output post rows:", len(out_rows))
+print("Skipped source rows (unresolvable creator):", skipped_rows)
+
+out_df = pd.DataFrame(out_rows)
+out_df.to_csv(OUTPUT_CSV, index=False)
+print("Saved:", OUTPUT_CSV)
