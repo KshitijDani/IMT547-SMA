@@ -18,3 +18,12 @@ venv/
 # Python cache
 __pycache__/
 *.pyc
+feed_post_counts.png
+feed_pca_map.png
+visualize_feed_semantics.py
+analysis_figures/feed_pca_map.png
+analysis_figures/feed_post_counts.png
+analysis_figures/post_umap_landscape_clusters.html
+analysis_figures/post_umap_landscape_clusters.png
+analysis_figures/post_umap_landscape.html
+analysis_figures/post_umap_landscape.png
